@@ -11,6 +11,9 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub phc_string: Option<String>,
     pub two_factor_enabled: i8,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub two_factor_secret: Option<String>,
+    pub two_factor_enable_date: Option<TimeDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::time::SystemTimeError;
 
 use crate::database::connect;
 
@@ -11,6 +12,7 @@ use sea_orm::error::DbErr;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use time::{Duration, OffsetDateTime, PrimitiveDateTime};
+use totp_rs::{Algorithm, Secret, TotpUrlError, TOTP};
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq, PartialOrd)]
@@ -22,7 +24,7 @@ pub struct UsernameAndPassword {
 #[derive(Debug, PartialEq, PartialOrd)]
 pub struct TwoFactorLoginRequest {
     pub username: String,
-    pub id: Uuid,
+    pub session_login_attempt_id: Uuid,
     pub otp: String,
 }
 
@@ -71,9 +73,10 @@ pub enum UserLoginError {
     VerificationFailed,
     UserIdParseFailure(uuid::Error),
     TokenParseFailure(uuid::Error),
-    NoSuchTwoFactorToken,
-    TwoFactorNeeded(Uuid), // reserved
-    AccountLocked,         // reserved
+    NoSuchTwoFactorSessionToken,
+    TwoFactorNeeded(Uuid),
+    IncorrectTwoFactor,
+    AccountLocked, // reserved
 }
 
 #[derive(Debug, PartialEq)]
@@ -88,6 +91,36 @@ enum AuthTokenCreationFailure {
     DatabaseError(DbErr),
     TokenParseFailure(uuid::Error),
     NoSuchTwoFactorToken,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TwoFactorInitErr {
+    AlreadyEnabled,
+    QrCreationFailure(String),
+}
+
+#[derive(Debug)]
+pub enum TwoFactorVerifyToEnableFailure {
+    TwoFactorAlreadyEnabled,
+    TwoFactorNotCreated,
+    ValidationTimedOut,
+    TotpErr(TotpUrlError),
+    SystemTimeError(SystemTimeError),
+    TwoFactorIncorrect,
+}
+
+#[derive(Debug)]
+enum TwoFactorVerifyErr {
+    TwoFactorNotEnabled,
+    SystemTimeError(SystemTimeError),
+    TotpErr(TotpUrlError),
+}
+
+#[derive(Debug)]
+pub enum VerifySessionTokenError {
+    ExpiredToken,
+    NoSuchToken,
+    DatabaseError(DbErr),
 }
 
 async fn get_user(username: &str) -> Result<Users::Model, UserGetError> {
@@ -148,6 +181,8 @@ pub async fn create_user(
         username: Set(user_creation_request.username.to_string()),
         phc_string: Set(Some(phc)),
         two_factor_enabled: Set(0),
+        two_factor_secret: Set(None),
+        two_factor_enable_date: Set(None),
     };
 
     let conn = connect().await;
@@ -324,9 +359,11 @@ pub async fn login_user(user_to_verify: &UserVerificationMethod) -> Result<Uuid,
             let now = OffsetDateTime::now_utc();
             let now = Some(PrimitiveDateTime::new(now.date(), now.time())).unwrap();
             let token_res = Tokens::Entity::find()
-                .filter(Tokens::Column::TokenId.eq(twofactor_login_request.id))
+                .filter(
+                    Tokens::Column::TokenId.eq(twofactor_login_request.session_login_attempt_id),
+                )
                 .filter(Tokens::Column::UserId.eq(&user.user_id))
-                .filter(Tokens::Column::ExpirationDate.lt(now))
+                .filter(Tokens::Column::ExpirationDate.gt(now))
                 .one(&conn)
                 .await;
 
@@ -334,7 +371,7 @@ pub async fn login_user(user_to_verify: &UserVerificationMethod) -> Result<Uuid,
             match token_res {
                 Ok(token_res) => match token_res {
                     Some(token_res) => token = token_res,
-                    None => return Err(UserLoginError::NoSuchTwoFactorToken),
+                    None => return Err(UserLoginError::NoSuchTwoFactorSessionToken),
                 },
                 Err(err) => return Err(UserLoginError::DatabaseError(err)),
             }
@@ -348,25 +385,50 @@ pub async fn login_user(user_to_verify: &UserVerificationMethod) -> Result<Uuid,
             }
 
             // Do whatever to validate OTP I guess?
-
-            // Create normal auth token and return
-            match create_auth_token(
-                Uuid::from_str(&user.user_id).unwrap(),
-                AuthTokenCreateType::New,
-            )
-            .await
-            {
-                Ok(res) => Ok(res),
+            match verify_twofac(user.to_owned(), twofactor_login_request.otp.to_owned()).await {
+                Ok(res) => {
+                    if res {
+                        // Create normal auth token and return
+                        match create_auth_token(
+                            Uuid::from_str(&user.user_id).unwrap(),
+                            AuthTokenCreateType::New,
+                        )
+                        .await
+                        {
+                            Ok(res) => {
+                                // delete 2fac session token
+                                let delete_res = Tokens::Entity::delete_by_id(token.token_id)
+                                    .exec(&conn)
+                                    .await;
+                                match delete_res {
+                                    Ok(_) => (),
+                                    Err(err) => {
+                                        dbg! {"error deleting 2fac session token {}",err};
+                                    }
+                                }
+                                Ok(res)
+                            }
+                            Err(err) => match err {
+                                AuthTokenCreationFailure::DatabaseError(err) => {
+                                    return Err(UserLoginError::DatabaseError(err))
+                                }
+                                AuthTokenCreationFailure::TokenParseFailure(err) => {
+                                    return Err(UserLoginError::TokenParseFailure(err))
+                                }
+                                AuthTokenCreationFailure::NoSuchTwoFactorToken => {
+                                    return Err(UserLoginError::NoSuchTwoFactorSessionToken)
+                                }
+                            },
+                        }
+                    } else {
+                        return Err(UserLoginError::IncorrectTwoFactor);
+                    }
+                }
                 Err(err) => match err {
-                    AuthTokenCreationFailure::DatabaseError(err) => {
-                        return Err(UserLoginError::DatabaseError(err))
+                    TwoFactorVerifyErr::TwoFactorNotEnabled => {
+                        return Err(UserLoginError::NoSuchTwoFactorSessionToken);
                     }
-                    AuthTokenCreationFailure::TokenParseFailure(err) => {
-                        return Err(UserLoginError::TokenParseFailure(err))
-                    }
-                    AuthTokenCreationFailure::NoSuchTwoFactorToken => {
-                        return Err(UserLoginError::NoSuchTwoFactorToken)
-                    }
+                    _ => return Err(UserLoginError::VerificationFailed),
                 },
             }
         }
@@ -467,4 +529,135 @@ async fn create_auth_token(
             ))
         }
     }
+}
+
+pub async fn init_twofac(mut user: Users::Model) -> Result<String, TwoFactorInitErr> {
+    // don't override the second factor if twofac is on
+    if user.two_factor_enabled == 1 {
+        dbg! {"Two factor already enabled"};
+        return Err(TwoFactorInitErr::AlreadyEnabled);
+    }
+
+    let secret = Secret::default();
+    let twofac = TOTP::new(
+        Algorithm::SHA512,
+        6,
+        1,
+        30,
+        secret.to_bytes().unwrap(),
+        Some("Rstmgmt".to_string()),
+        user.username.to_owned(),
+    )
+    .unwrap();
+
+    user.two_factor_secret = Some(secret.to_string());
+    let code = twofac.get_qr();
+    match code {
+        Ok(code) => return Ok(code),
+        Err(err) => return Err(TwoFactorInitErr::QrCreationFailure(err)),
+    }
+}
+
+pub async fn enable_twofac(
+    mut user: Users::Model,
+    otp: String,
+) -> Result<(), TwoFactorVerifyToEnableFailure> {
+    if Some(user.two_factor_secret.to_owned()).is_none() {
+        return Err(TwoFactorVerifyToEnableFailure::TwoFactorNotCreated);
+    }
+    if user.two_factor_enabled == 1 {
+        return Err(TwoFactorVerifyToEnableFailure::TwoFactorAlreadyEnabled);
+    }
+    let now = OffsetDateTime::now_utc();
+    if PrimitiveDateTime::new(now.date(), now.time()) > user.two_factor_enable_date.unwrap() {
+        user.two_factor_secret = None;
+        user.two_factor_enable_date = None;
+        return Err(TwoFactorVerifyToEnableFailure::ValidationTimedOut);
+    } else {
+        match verify_twofac(user.to_owned(), otp).await {
+            Ok(matches) => {
+                if matches {
+                    user.two_factor_enabled = 1;
+                    return Ok(());
+                } else {
+                    return Err(TwoFactorVerifyToEnableFailure::TwoFactorIncorrect);
+                }
+            }
+            Err(err) => match err {
+                TwoFactorVerifyErr::TwoFactorNotEnabled => {
+                    return Err(TwoFactorVerifyToEnableFailure::TwoFactorNotCreated)
+                }
+                TwoFactorVerifyErr::SystemTimeError(err) => {
+                    return Err(TwoFactorVerifyToEnableFailure::SystemTimeError(err))
+                }
+                TwoFactorVerifyErr::TotpErr(err) => {
+                    return Err(TwoFactorVerifyToEnableFailure::TotpErr(err))
+                }
+            },
+        }
+    }
+}
+
+async fn verify_twofac(user: Users::Model, otp: String) -> Result<bool, TwoFactorVerifyErr> {
+    if Some(user.two_factor_secret.to_owned()).is_none() {
+        return Err(TwoFactorVerifyErr::TwoFactorNotEnabled);
+    }
+
+    let totp = TOTP::new(
+        Algorithm::SHA512,
+        6,
+        1,
+        30,
+        user.two_factor_secret.unwrap().as_bytes().to_vec(),
+        Some("Rstmgmt".to_string()),
+        user.username,
+    );
+
+    match totp {
+        Ok(totp) => {
+            let res = totp.check_current(&otp);
+            match res {
+                Ok(matches) => {
+                    return Ok(matches);
+                }
+                Err(err) => return Err(TwoFactorVerifyErr::SystemTimeError(err)),
+            }
+        }
+        Err(err) => return Err(TwoFactorVerifyErr::TotpErr(err)),
+    }
+}
+
+pub async fn verify_session_token(session_token: Uuid) -> Result<(), VerifySessionTokenError> {
+    let conn = connect().await;
+    match conn {
+        Ok(conn) => {
+            let token = Tokens::Entity::find_by_id(session_token.to_string())
+                .one(&conn)
+                .await;
+            match token {
+                Ok(token) => match token {
+                    Some(token) => {
+                        let now = OffsetDateTime::now_utc();
+                        if Some(PrimitiveDateTime::new(now.date(), now.time())).unwrap()
+                            < token.expiration_date
+                        {
+                            if token.is_two_factor_token == 0 {
+                                return Ok(());
+                            } else {
+                                return Err(VerifySessionTokenError::NoSuchToken);
+                            }
+                        }
+                    }
+                    None => return Err(VerifySessionTokenError::NoSuchToken),
+                },
+                Err(err) => return Err(VerifySessionTokenError::DatabaseError(err)),
+            }
+        }
+        Err(err) => {
+            return Err(VerifySessionTokenError::DatabaseError(
+                sea_orm::DbErr::ConvertFromU64(err),
+            ))
+        }
+    }
+    todo! {}
 }

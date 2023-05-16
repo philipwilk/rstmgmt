@@ -21,6 +21,8 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(Users::Username).string().not_null())
                     .col(ColumnDef::new(Users::PhcString).text())
                     .col(ColumnDef::new(Users::TwoFactorEnabled).boolean().not_null())
+                    .col(ColumnDef::new(Users::TwoFactorSecret).text())
+                    .col(ColumnDef::new(Users::TwoFactorEnableDate).date_time())
                     .to_owned(),
             )
             .await
@@ -42,4 +44,6 @@ pub enum Users {
     Username,
     PhcString,
     TwoFactorEnabled,
+    TwoFactorSecret,
+    TwoFactorEnableDate,
 }
